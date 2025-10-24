@@ -933,6 +933,166 @@ export function DocumentScanScreen() {
 
 ---
 
+## 4.4 VIS Control App - Detailed Implementation
+
+### 4.4.1 Purpose
+
+The centerpiece iPad app showing a **real-time 3D visualization** of the VIS room during a scan session — like watching an AI think through the diagnostic process.
+
+### 4.4.2 Features
+
+**3D Room Visualization (Three.js):**
+- Isometric or first-person view of VIS room
+- 3D models of:
+  - Patient (pose estimated from camera feed)
+  - Rotating platform
+  - Canon R5/R5C cameras (with FOV cones)
+  - Lighting setup
+  - Facilitator position
+  - Connected devices (DEXA, retinal imager, etc.)
+
+**Real-Time Activity Feed:**
+- Camera capture events ("Macro shot captured - right retina")
+- Device status ("DEXA scan 35% complete")
+- AI reasoning ("Detecting vessel abnormalities... confidence 87%")
+- Platform movements ("Rotating to position 3/8")
+- Quality checks ("Image quality: Excellent ✓")
+
+**Flowise Reasoning Panel:**
+- Live stream of Flowise workflow execution
+- Show which nodes are active
+- Display LLM thinking (if using chain-of-thought prompting)
+- Confidence scores for AI decisions
+- Human approval gates ("Retinal focus acceptable? [Yes] [Retry]")
+
+**Session Timeline:**
+- Vertical timeline showing completed/pending steps
+- Estimated time remaining
+- Anomaly flags
+
+### 4.4.3 Technical Implementation
+
+**3D Rendering:**
+```typescript
+// apps/vis-control/components/VISRoom3D.tsx
+import { Canvas } from '@react-three/fiber'
+import { OrbitControls, PerspectiveCamera } from '@react-three/drei'
+
+export function VISRoom3D({ sessionState }: Props) {
+  return (
+    <Canvas>
+      <PerspectiveCamera position={[5, 5, 5]} />
+      <OrbitControls />
+
+      <Room />
+      <Platform rotation={sessionState.platformAngle} />
+      <Patient pose={sessionState.patientPose} />
+      <Camera
+        position={sessionState.camera1Position}
+        active={sessionState.activeCamera === 'R5'}
+      />
+      <Lighting setup={sessionState.lightingConfig} />
+
+      <ActivityMarkers events={sessionState.recentEvents} />
+    </Canvas>
+  )
+}
+```
+
+**Flowise Integration:**
+```typescript
+// packages/flowise-sdk/client.ts
+export class FlowiseClient {
+  private ws: WebSocket
+
+  subscribeToWorkflow(workflowId: string, onUpdate: (node: WorkflowNode) => void) {
+    this.ws.on('node:start', (data) => {
+      onUpdate({ status: 'running', ...data })
+    })
+
+    this.ws.on('node:complete', (data) => {
+      onUpdate({ status: 'completed', ...data })
+    })
+
+    this.ws.on('llm:thinking', (data) => {
+      // Expose chain-of-thought reasoning
+      onUpdate({ type: 'reasoning', content: data.thinking })
+    })
+  }
+}
+```
+
+**Real-Time Updates via WebSocket + Redis Pub/Sub:**
+```typescript
+// All iPads subscribe to session-specific channels
+const channel = `session:${sessionId}:updates`
+
+redis.subscribe(channel, (message) => {
+  // Parse and display update in 3D scene + activity feed
+  handleSessionUpdate(message)
+})
+```
+
+### 4.4.4 Screen Flow
+
+**VIS Control App:**
+1. **Session Start Screen**
+   - Patient info card
+   - Session checklist (devices connected, patient positioned)
+   - [Start Session] button
+
+2. **Live Session Screen** (3D visualization)
+   - 3D room scene (60% of screen)
+   - Activity feed (right sidebar)
+   - Flowise reasoning panel (bottom drawer, expandable)
+   - Session controls (Pause, Emergency Stop)
+
+3. **Review Screen**
+   - Captured images gallery
+   - AI findings summary
+   - Quality metrics
+   - [Approve & Continue] or [Retry]
+
+---
+
+## 4.5 iPad Interface Design Principles
+
+### 4.5.1 Visual Language
+
+**Transparency:**
+- Always show AI confidence scores
+- Expose reasoning, don't hide complexity
+- Real-time activity feeds
+- No "black box" decisions
+
+**Clarity:**
+- Large, readable typography (SF Pro, Inter)
+- High contrast for medical displays
+- Color-coded status indicators
+- Progressive disclosure (details on tap)
+
+**Responsiveness:**
+- 60 FPS animations (3D scenes)
+- Haptic feedback for interactions
+- <100ms interaction latency
+- Optimistic UI updates
+
+### 4.5.2 Interaction Patterns
+
+**Touch-First:**
+- Large tap targets (44x44pt minimum)
+- Swipe gestures for navigation
+- Pinch-to-zoom for images/3D scenes
+- Long-press for contextual actions
+
+**Multi-iPad Coordination:**
+- Each iPad shows its "feature node"
+- All iPads can view master timeline
+- Facilitator can push views to patient iPads
+- Synchronized 3D cameras (VIS room view)
+
+---
+
 ## 5. Development Phases (Updated)
 
 ### 5.1 Phase 0: Foundation (Month 1)
@@ -1403,6 +1563,103 @@ enum DeviceStatus {
 
 ---
 
+## 6.1 Flowise Workflows (Examples)
+
+### 6.1.1 VIS Session Orchestration Workflow
+
+```yaml
+Workflow: "VIS Session Orchestration"
+
+Nodes:
+  1. Session Start Trigger (Webhook)
+  2. Check Device Status (Custom Tool)
+     - Verify cameras online
+     - Check platform connection
+     - Validate lighting
+  3. Patient Positioning Guidance (LLM)
+     - Generate instructions based on patient profile
+     - Output to VIS app
+  4. Camera Calibration Sequence
+     - Rotate platform 360°
+     - Capture test shots
+     - AI quality check
+  5. Primary Capture Sequence (Loop)
+     - For each angle (0°, 45°, 90°, ...)
+       - Rotate platform
+       - Adjust lighting
+       - Capture still + video
+       - Quality check (LLM analyzes image)
+       - If fail: retry logic
+  6. Retinal Imaging Trigger
+     - Switch to CX-1 device
+     - Capture fundus + OCT
+  7. Session Complete
+     - Generate preview report
+     - Notify facilitator
+     - Queue for processing
+
+Human-in-the-Loop Gates:
+  - After Node 3: "Patient positioned correctly?"
+  - After Node 5: "Review captured images"
+  - After Node 6: "Retinal focus acceptable?"
+
+Exposed Reasoning:
+  - Node 4 LLM: "Analyzing test shot... checking focus, exposure, patient visibility..."
+  - Node 5 LLM: "Image quality assessment: Focus=9.2/10, Exposure=8.8/10, Coverage=Complete"
+```
+
+### 6.1.2 Multi-Modal Biomarker Fusion Workflow
+
+```yaml
+Workflow: "Comprehensive Health Analysis"
+
+Trigger: All session data captured
+
+Nodes:
+  1. Data Aggregation
+     - Fetch VIS images from MinIO
+     - Fetch DEXA results from DB
+     - Fetch retinal OCT from DB
+     - Fetch lab results (if available)
+     - Fetch cardio metrics
+
+  2. Individual Domain Analysis (Parallel)
+     - Retinal AI Model → vessel health score
+     - Body Composition Parser → lean mass, visceral fat
+     - Cardiovascular Analyzer → VO₂ percentile, BP risk
+
+  3. Cross-Domain Correlation (LLM Agent)
+     - Prompt: "Analyze these biomarkers for systemic patterns..."
+     - Input: All domain results
+     - Output: Correlation insights (e.g., "Retinal microvasculature narrowing correlates with elevated BP")
+
+  4. Risk Stratification (LLM Agent)
+     - Calculate risk scores (cardiovascular, metabolic, etc.)
+     - Compare to population norms
+     - Identify trends vs. previous sessions
+
+  5. Recommendation Generation (LLM Agent)
+     - Personalized interventions (exercise, nutrition, follow-up)
+     - Prioritized by impact and feasibility
+
+  6. Report Assembly
+     - Generate PDF with all findings
+     - Include transparent reasoning from each agent
+     - Confidence scores for all AI predictions
+
+  7. Human Review Gate
+     - Clinician reviews report
+     - Can edit LLM suggestions
+     - Approve for patient delivery
+
+Reasoning Transparency:
+  - Node 3: Show LLM chain-of-thought
+  - Node 4: Display risk calculation logic
+  - Node 5: Explain why each recommendation was made
+```
+
+---
+
 ## 7. Deployment Architecture
 
 ### 7.1 Computer 1 (Cloud) - DigitalReality NYC
@@ -1686,7 +1943,349 @@ WantedBy=multi-user.target
 
 ---
 
-## 10. Week 1 Action Plan (Updated)
+## 10. Quality Assurance Strategy
+
+### 10.1 Testing Pyramid
+
+```
+        ┌─────────────┐
+        │   Manual    │  5%
+        │  Exploratory│
+        └─────────────┘
+      ┌───────────────────┐
+      │   E2E Tests       │  15%
+      │  (Playwright)     │
+      └───────────────────┘
+    ┌─────────────────────────┐
+    │  Integration Tests      │  30%
+    │  (API, Database)        │
+    └─────────────────────────┘
+  ┌───────────────────────────────┐
+  │     Unit Tests                │  50%
+  │  (Jest, Vitest)               │
+  └───────────────────────────────┘
+```
+
+### 10.2 Quality Gates
+
+**Per Pull Request:**
+- All tests passing (unit, integration)
+- Code coverage >80%
+- Linter warnings = 0
+- Security scan (npm audit, Snyk)
+- Code review approved (self-review initially, team review as you grow)
+
+**Per Release:**
+- E2E test suite passing
+- Performance benchmarks met
+- Security audit completed
+- Documentation updated
+- Changelog generated
+
+### 10.3 Performance Benchmarks
+
+| Metric | Target | Critical Threshold |
+|:--|:--|:--|
+| API response time (p95) | <500ms | <2s |
+| Image upload speed | >10 MB/s | >5 MB/s |
+| AI inference latency | <3s | <10s |
+| Dashboard load time | <1s | <3s |
+| Database query time (p95) | <100ms | <500ms |
+| Mobile app launch time | <2s | <5s |
+
+---
+
+## 11. Security & Compliance
+
+### 11.1 HIPAA Compliance Checklist
+
+**Administrative Safeguards:**
+- [ ] Security management process
+- [ ] Assigned security responsibility
+- [ ] Workforce security policies
+- [ ] Information access management
+- [ ] Security awareness training
+- [ ] Security incident procedures
+- [ ] Contingency planning
+- [ ] Business associate agreements
+
+**Physical Safeguards:**
+- [ ] Facility access controls
+- [ ] Workstation use policies
+- [ ] Device and media controls
+- [ ] Secure workstation placement (locked room)
+
+**Technical Safeguards:**
+- [ ] Access control (unique user IDs, emergency access, encryption)
+- [ ] Audit controls (activity logging)
+- [ ] Integrity controls (data validation)
+- [ ] Transmission security (encryption in transit)
+
+### 11.2 Security Implementation
+
+**Authentication & Authorization:**
+- Clerk-based SSO with MFA
+- RBAC implementation (Admin, Clinician, Patient, Facilitator)
+- JWT tokens with short expiration (15 min access, 7 day refresh)
+- API key rotation for device access (monthly)
+- Session management (auto-logout after inactivity)
+
+**Data Encryption:**
+- TLS 1.3 for all communications (cloud ↔ workstation ↔ mobile)
+- AES-256 encryption at rest (MinIO, PostgreSQL)
+- Field-level encryption for sensitive data (SSN, DOB, medical history)
+- Encrypted backups
+
+**Audit Logging:**
+- All data access logged (who, what, when)
+- Immutable audit trail (append-only logs)
+- 7-year retention policy
+- SIEM integration for anomaly detection (as you scale)
+- Regular audit log reviews
+
+**Network Security:**
+- VPC isolation (cloud)
+- Firewall rules (workstation)
+- WAF (Web Application Firewall) for cloud API
+- DDoS protection (CloudFlare)
+- Rate limiting on all APIs (prevent abuse)
+- IP whitelisting for workstation ↔ cloud sync (optional)
+
+**Mobile App Security:**
+- Certificate pinning (prevent MITM attacks)
+- Biometric authentication (Face ID, Touch ID)
+- Secure storage (iOS Keychain, Android Keystore)
+- No sensitive data in logs
+- Jailbreak/root detection
+
+---
+
+## 12. Deployment Strategy Details
+
+### 12.1 Environment Structure
+
+| Environment | Purpose | Deployment Frequency |
+|:--|:--|:--|
+| **Development** | Local development (your workstation) | Continuous |
+| **Staging** | Pre-production validation (cloud) | Per feature completion |
+| **Production** | Live system (cloud + retail) | Bi-weekly releases |
+
+### 12.2 Deployment Pipeline (Cloud)
+
+```
+┌──────────────┐
+│  Git Push    │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────┐
+│  GitHub Actions  │
+│  - Lint          │
+│  - Unit Tests    │
+│  - Build         │
+│  - Type Check    │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Build Docker    │
+│  Images          │
+│  - cloud-api     │
+│  - flowise       │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Push to         │
+│  Container Reg   │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Deploy to       │
+│  Staging (K8s)   │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Integration &   │
+│  E2E Tests       │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Manual Approval │
+│  (Your review)   │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Deploy to       │
+│  Production      │
+│  (Blue/Green)    │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  Smoke Tests     │
+│  Health Checks   │
+│  Monitoring      │
+└──────────────────┘
+```
+
+### 12.3 Mobile App Deployment (Expo EAS)
+
+```
+┌──────────────────┐
+│  Code Complete   │
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────┐
+│  eas build       │
+│  --platform all  │
+│  --profile prod  │
+└──────┬───────────┘
+       │
+       ├──────────────────┐
+       │                  │
+       ▼                  ▼
+┌──────────────┐  ┌──────────────┐
+│  iOS Build   │  │ Android Build│
+│  (TestFlight)│  │ (Play Store) │
+└──────┬───────┘  └──────┬───────┘
+       │                  │
+       └────────┬─────────┘
+                │
+                ▼
+        ┌──────────────────┐
+        │  Internal Testing│
+        │  (Your device +  │
+        │   beta testers)  │
+        └──────┬───────────┘
+               │
+               ▼
+        ┌──────────────────┐
+        │  Production      │
+        │  Release         │
+        └──────────────────┘
+```
+
+### 12.4 Workstation Deployment
+
+**Initial Setup:**
+1. Clone repo to workstation
+2. Run setup script: `./scripts/setup-workstation.sh`
+3. Configure environment variables
+4. Start services: `docker-compose up -d`
+5. Run initial sync: `npm run sync:cloud`
+
+**Updates:**
+1. Pull latest code: `git pull origin main`
+2. Run migrations: `npx prisma migrate deploy`
+3. Rebuild containers: `docker-compose build`
+4. Restart services: `docker-compose restart`
+5. Verify health: `npm run health-check`
+
+### 12.5 Rollback Strategy
+
+- **Cloud:** Blue/Green deployments (zero-downtime)
+- **Mobile:** Staged rollout (10% → 50% → 100%)
+- **Workstation:** Keep previous version in `backup/` directory
+- Feature flags for gradual rollout (LaunchDarkly or custom)
+- Automated rollback on health check failure
+- Database migrations versioned (Prisma)
+- Rollback runbook documented
+
+---
+
+## 13. Risk Management
+
+### 13.1 Technical Risks
+
+| Risk | Probability | Impact | Mitigation |
+|:--|:--|:--|:--|
+| Device SDK integration failures | Medium | High | Early prototype testing, vendor support contracts, fallback to manual control |
+| AI model accuracy below threshold | Medium | High | Continuous validation, human review gates, fallback to manual analysis |
+| Database performance bottlenecks | Low | Medium | Early load testing, read replicas, Redis caching |
+| HIPAA compliance gaps | Low | Critical | Third-party audit (year 2), compliance consultant, regular self-audits |
+| Cloud vendor lock-in | Medium | Medium | Multi-cloud abstractions, containerization, local-first design |
+| Workstation hardware failure | Medium | High | Spare parts inventory, vendor warranty, backup workstation |
+| Mobile app rejection (App Store) | Low | Medium | Follow guidelines strictly, pre-submission review |
+| Data loss | Low | Critical | Automated backups (daily), 3-2-1 backup rule, test restores monthly |
+
+### 13.2 Project Risks
+
+| Risk | Probability | Impact | Mitigation |
+|:--|:--|:--|:--|
+| Scope creep | High | High | Strict change control, phased rollout, MVP-first mindset |
+| Solo developer burnout | Medium | Critical | Realistic timeline, regular breaks, hire help when revenue allows |
+| Hardware delivery delays | Medium | Medium | Multiple vendor options, buffer time, lease equipment initially |
+| Regulatory approval delays (FDA) | Medium | High | Start as wellness (non-diagnostic), phased SaMD approach |
+| Budget overruns | Medium | High | Monthly financial reviews, 20% contingency, lean approach |
+| Participant adoption slow | Medium | High | Strong marketing, referral program, exceptional UX |
+| Competitive pressure | Low | Medium | Open source moat, community building, unique transparency |
+
+---
+
+## 14. Team Structure & Growth Plan
+
+### 14.1 Solo Phase (Months 1-12)
+
+**You (CTO/Co-Founder):**
+- Architecture & technical decisions
+- Full-stack development (cloud, workstation, mobile)
+- DevOps & infrastructure
+- Hardware integration
+- Documentation
+- Initial customer support
+
+**Tools to Stay Productive:**
+- GitHub Copilot / Cursor for coding assistance
+- ChatGPT / Claude for problem-solving
+- Automated testing (catch bugs early)
+- Good documentation (your future self will thank you)
+- Regular breaks (avoid burnout)
+
+### 14.2 First Hire (Month 12-18)
+
+**Recommended:** Full-Stack Engineer
+
+**Responsibilities:**
+- Mobile app development (Expo)
+- Frontend iPad apps (Next.js)
+- Help with backend API
+- Testing & QA
+- Customer support escalations
+
+**Why full-stack?** Maximizes flexibility, reduces communication overhead
+
+### 14.3 Growth Phase (Months 18-36)
+
+**Team at 18 months (5 people):**
+- You (CTO)
+- Full-Stack Engineer #1 (mobile/frontend focus)
+- Backend Engineer (NestJS, cloud infrastructure)
+- AI/ML Engineer (model training, Flowise workflows)
+- Designer/Product Manager (UX, product direction)
+
+**Team at 36 months (12-15 people):**
+- Engineering (8): 2 mobile, 2 frontend, 2 backend, 1 DevOps, 1 AI/ML
+- Product (2): 1 PM, 1 Designer
+- Operations (2): Customer success, Compliance specialist
+- Sales/Marketing (2-3)
+
+### 14.4 Key Hiring Principles
+
+1. **Hire for mission alignment** - Open source, transparency, health equity
+2. **Generalists over specialists** (early stage)
+3. **Remote-first** - Access global talent
+4. **Equity-heavy comp** - Conserve cash
+5. **Slow hiring, fast firing** - Cultural fit matters
+
+---
+
+## 15. Week 1 Action Plan (Updated)
 
 ### Day 1: Cloud Infrastructure
 - [ ] Provision DigitalReality server
@@ -1729,9 +2328,9 @@ WantedBy=multi-user.target
 
 ---
 
-## 11. Open Source Strategy
+## 16. Open Source Strategy
 
-### 11.1 Public Repository
+### 16.1 Public Repository
 
 **Repo:** `vantage-health/vantage` (MIT License)
 
@@ -1790,7 +2389,7 @@ transparent, patient-centric health platform.
 MIT License - see [LICENSE](LICENSE)
 ```
 
-### 11.2 Community Engagement
+### 16.2 Community Engagement
 
 **Launch Plan:**
 1. **Soft launch:** Tweet thread + Hacker News post
@@ -1808,9 +2407,9 @@ MIT License - see [LICENSE](LICENSE)
 
 ---
 
-## 12. Long-Term Vision
+## 17. Long-Term Vision
 
-### 12.1 3-Year Roadmap
+### 17.1 3-Year Roadmap
 
 **Year 1:**
 - Launch mobile app (10K downloads)
@@ -1830,7 +2429,7 @@ MIT License - see [LICENSE](LICENSE)
 - FDA cleared for diagnostic use
 - $50M Series A
 
-### 12.2 Impact Goals
+### 17.2 Impact Goals
 
 **Health Equity:**
 - Reduce cost of comprehensive imaging 10×
@@ -1849,7 +2448,7 @@ MIT License - see [LICENSE](LICENSE)
 
 ---
 
-## 13. Conclusion
+## 18. Conclusion
 
 The **3 Computer Architecture** transforms Vantage into a scalable, transparent, patient-centric health platform. By distributing intelligence across cloud (training + orchestration), workstation (real-time inference), and mobile/edge (patient interface), we achieve:
 
