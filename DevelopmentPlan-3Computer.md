@@ -120,21 +120,23 @@ The Vantage Imaging System implements **NVIDIA's 3 Computer Architecture** for d
 - **Backend:** NestJS API (TypeScript)
 - **Database:** PostgreSQL (primary source of truth)
 - **Storage:** S3-compatible (MinIO or AWS S3)
-- **AI Orchestration:** Flowise (global instance)
+- **Workflow Engine:** Temporal Cloud (HIPAA-eligible with BAA)
+- **AI Orchestration:** Flowise (LLM prompt chains)
 - **Queue:** BullMQ + Redis
-- **Auth:** Clerk (mobile + web)
+- **Auth:** Clerk Enterprise with BAA (or Auth0/Okta)
 - **API:** tRPC (type-safe) + REST (mobile)
 
 **Responsibilities:**
+- **Durable session workflows** (Temporal: check-in → capture → analysis → report)
 - User authentication & profiles
 - Mobile app API endpoints
 - Historical data aggregation
-- Model training (RunPod DGX)
+- Model training (RunPod DGX - de-identified data only)
 - Cross-location analytics
-- Global Flowise workflows
+- Flowise LLM workflows (AI reasoning, report generation)
 - Sync coordination with retail workstations
 - Apple Health / Garmin data ingestion
-- Document processing (OCR for medical records)
+- Document processing (OCR via Azure OpenAI with BAA)
 
 **Infrastructure:**
 - DigitalReality: Dedicated server (16+ core, 128GB RAM, A6000 GPU)
@@ -149,14 +151,18 @@ The Vantage Imaging System implements **NVIDIA's 3 Computer Architecture** for d
 **Hardware:** RTX 6000 Pro Blackwell + Ryzen 9950X3D + 256GB RAM + 12TB NVMe
 
 **Stack:**
-- **Orchestration:** Flowise (synced from cloud)
+- **Workflow Worker:** Temporal worker (executes activities for cloud workflows)
+- **AI Orchestration:** Flowise (local LLM chains for quality checks)
 - **Frontend:** Next.js apps (iPad interfaces)
-- **Database:** PostgreSQL (local replica with sync)
+- **Database:** PostgreSQL (local replica with logical replication)
 - **Storage:** MinIO (local cache, syncs to cloud)
 - **LLM:** Ollama + vLLM (local inference)
 - **Queue:** BullMQ + Redis
+- **Streaming:** RTP/RTSP receiver (H.265 from Jetson)
+- **Control:** MQTT broker with TLS
 
 **Responsibilities:**
+- **Execute Temporal activities** (capture, sync, local AI)
 - Control all imaging devices (cameras, DEXA, OCT)
 - Real-time AI inference during sessions
 - 3D visualization for in-store iPads
@@ -2285,52 +2291,303 @@ WantedBy=multi-user.target
 
 ---
 
-## 15. Week 1 Action Plan (Updated)
+## 15. Week 0: HIPAA/PHI Compliance Prerequisites
 
-### Day 1: Cloud Infrastructure
-- [ ] Provision DigitalReality server
-- [ ] Install Ubuntu, Docker, Kubernetes
-- [ ] Deploy PostgreSQL (managed or self-hosted)
-- [ ] Deploy Redis
-- [ ] Setup CloudFlare DNS
+**⚠️ CRITICAL: These must be addressed BEFORE handling any PHI (Protected Health Information)**
 
-### Day 2: Cloud Backend
-- [ ] Clone monorepo
-- [ ] Initialize `apps/cloud-api` (NestJS)
-- [ ] Setup Prisma, run migrations
-- [ ] Deploy Clerk auth
-- [ ] Create first tRPC endpoint: `health.ping`
-- [ ] Deploy to cloud (test URL)
+### Gating Items for PHI Compliance
 
-### Day 3: Mobile App
-- [ ] Initialize `apps/mobile` (Expo)
-- [ ] Setup tRPC client
-- [ ] Implement login screen (Clerk)
-- [ ] Test: Login from mobile → cloud API
-- [ ] Deploy to TestFlight (internal)
+| Area | Current Plan | Gap | Required Action |
+|:--|:--|:--|:--|
+| **Auth & Identity** | Clerk across mobile/web | Use only if Enterprise + BAA; otherwise PHI risk | ✅ Verify Clerk Enterprise BAA, OR switch to Auth0/Okta with BAA, OR self-hosted OIDC |
+| **Edge/CDN** | Cloudflare Pro | Cloudflare BAA is Enterprise-only; Pro ≠ HIPAA | ✅ Upgrade to Cloudflare Enterprise OR terminate PHI at origin (no PHI in CDN cache) |
+| **GPU Training Cloud** | RunPod DGX | No public BAA; treat as non-HIPAA | ✅ Train with de-identified/synthetic data ONLY on RunPod; PHI workloads to Azure (with BAA) or colo |
+| **LLM for OCR/IE** | ChatOpenAI (OpenAI) | API use may be HIPAA only with BAA; ChatGPT UI is not | ✅ Get OpenAI API BAA + zero retention, OR use Azure OpenAI with Microsoft BAA, OR run local models |
+| **Observability** | Datadog | Allowed only on HIPAA-eligible services with BAA | ✅ Execute Datadog BAA and restrict to eligible services (logs may include PHI) |
+| **Workflow Orchestration** | Flowise | No BAA; not designed for PHI | ✅ Use Temporal Cloud with BAA for session lifecycles; keep Flowise for LLM chains only |
 
-### Day 4: Workstation
-- [ ] Install Ubuntu on workstation
-- [ ] NVIDIA drivers + CUDA
-- [ ] Docker Compose up (postgres, redis, ollama, flowise)
-- [ ] Clone monorepo
-- [ ] Create first Next.js app: `apps/facilitator-portal`
-- [ ] Test: Access from iPad on local network
+**Rule of Thumb:** No PHI on vendors without BAA. Where BAA is available, scope to HIPAA-eligible services only.
 
-### Day 5: Integration Test
-- [ ] Mobile app → Cloud API → Workstation sync
-- [ ] Create test user on mobile
-- [ ] Sync to cloud
-- [ ] Verify in workstation local DB
-- [ ] Document setup process
+### Week 0 Checklist
 
-**Week 1 Goal:** All 3 computers talking to each other, mobile app in TestFlight, workstation accessible from iPad.
+#### Day 1-2: Vendor Compliance Audit
+
+- [ ] **Clerk:** Verify Enterprise plan + execute BAA
+  - If not available: Switch to Auth0 (HIPAA-eligible) or Okta
+  - Reference: [Clerk HIPAA Compliance](https://clerk.com/docs/security/hipaa)
+
+- [ ] **Cloudflare:** Upgrade to Enterprise plan
+  - Configure: Bypass caching for `/api/*` PHI endpoints
+  - Reference: [Cloudflare HIPAA](https://www.cloudflare.com/trust-hub/compliance-resources/)
+
+- [ ] **OpenAI:** Switch to Azure OpenAI Service
+  - Microsoft BAA covers Azure OpenAI
+  - Configure: Zero data retention policy
+  - Reference: [Azure OpenAI HIPAA](https://learn.microsoft.com/en-us/legal/cognitive-services/openai/data-privacy)
+
+- [ ] **Datadog:** Execute BAA
+  - Restrict to HIPAA-eligible services only
+  - Configure: No PHI in log messages, APM spans, or custom metrics
+  - Reference: [Datadog HIPAA](https://www.datadoghq.com/legal/hipaa/)
+
+- [ ] **Temporal Cloud:** Execute BAA
+  - HIPAA-eligible control plane
+  - Reference: [Temporal Cloud Security](https://docs.temporal.io/cloud/security#hipaa-compliance)
+
+- [ ] **RunPod:** Mark as NON-PHI environment
+  - Use ONLY for: De-identified data training, synthetic data experiments
+  - Never: Upload real patient images, PII, or session data
+
+#### Day 3: Data Classification Policy
+
+- [ ] **Define PHI vs Non-PHI boundaries**
+  ```typescript
+  // Clear data classification
+  const PHI_FIELDS = ['ssn', 'dob', 'medicalHistory', 'diagnosis', 'patientImages']
+  const NON_PHI_FIELDS = ['sessionId', 'timestamp', 'deviceType', 'qualityScore']
+  ```
+
+- [ ] **Implement PHI-free logging**
+  ```typescript
+  // NEVER log PHI
+  logger.info('Session started', { sessionId: 'sess_abc', userId: 'usr_xyz' }) // ✅ OK
+  logger.error('Upload failed', { patientName: 'John Doe' }) // ❌ FORBIDDEN
+  ```
+
+- [ ] **Configure Datadog tag filters**
+  - Block: `user.name`, `user.email`, `patient.*`, `diagnosis`, `ssn`, `dob`
+  - Allow: `session.id`, `device.type`, `location.id`, `error.type`
+
+- [ ] **Mobile push notifications: No PHI**
+  ```typescript
+  // Correct approach
+  await expo.sendPush({
+    to: userToken,
+    body: 'Your report is ready to view.' // ✅ No PHI
+  })
+  // Mobile app fetches details via authenticated tRPC call
+  ```
+
+#### Day 4-5: Infrastructure PHI Controls
+
+- [ ] **Encryption at rest**
+  - Workstation: LUKS encryption on all SSDs
+  - Cloud: S3/MinIO with SSE-KMS (AWS KMS or Azure Key Vault)
+  - Database: PostgreSQL TDE (Transparent Data Encryption)
+
+- [ ] **Encryption in transit**
+  - All endpoints: TLS 1.3 minimum
+  - MQTT: Enable TLS + client certificates
+  - Mobile: Certificate pinning
+
+- [ ] **Access controls**
+  - Database: Row-Level Security (RLS) with `tenantId`
+  - S3 buckets: Per-tenant isolation
+  - API: RBAC (Admin, Clinician, Patient, Facilitator)
+
+- [ ] **Audit logging**
+  - Enable: PostgreSQL audit logs (all PHI access)
+  - Enable: S3 access logs
+  - Enable: Temporal audit logging (Cloud)
+  - Retention: 7 years (HIPAA requirement)
+
+#### Day 6-7: Testing & Validation
+
+- [ ] **PHI leak detection tests**
+  ```bash
+  # Scan logs for PHI patterns
+  grep -r "ssn\|social.*security\|date.*birth" /var/log/vantage/
+  ```
+
+- [ ] **Pen test key scenarios**
+  - Can unauthenticated user access PHI?
+  - Can Patient A access Patient B's data?
+  - Are logs/metrics PHI-free?
+  - Is data encrypted at rest and in transit?
+
+- [ ] **Document PHI boundaries**
+  - Create: `docs/security/phi-boundaries.md`
+  - Include: Data flow diagrams showing PHI vs non-PHI paths
+
+### Week 0 Deliverables
+
+✅ **All vendor BAAs executed** (Clerk OR Auth0, Cloudflare, Azure OpenAI, Datadog, Temporal Cloud)
+✅ **PHI classification documented** and enforced in code
+✅ **Encryption enabled** everywhere (at-rest, in-transit)
+✅ **Audit logging operational** (7-year retention)
+✅ **No PHI in logs/metrics/push notifications** (validated via automated scans)
+
+**Only after Week 0 completion:** Proceed to Week 1 development.
 
 ---
 
-## 16. Open Source Strategy
+## 16. Week 1 Action Plan (Updated with Temporal)
 
-### 16.1 Public Repository
+**Prerequisites:** Week 0 HIPAA gating items completed ✅
+
+### Day 1: Vendors & Risk (Compliance-First)
+
+- [ ] **Execute/verify all BAAs**
+  - Clerk Enterprise (or switch to Auth0/Okta)
+  - Cloudflare Enterprise
+  - Azure OpenAI (Microsoft BAA)
+  - Datadog (HIPAA-eligible services only)
+  - Temporal Cloud
+
+- [ ] **Configure Cloudflare caching rules**
+  - Bypass caching for `/api/*` PHI endpoints
+  - Configure WAF rules
+
+- [ ] **Mark RunPod as NON-PHI**
+  - Document: Use only for de-identified/synthetic data
+  - Never: Real patient images or session data
+
+- [ ] **Setup audit logging infrastructure**
+  - PostgreSQL audit extension
+  - S3 access logs
+  - Temporal Cloud audit logs enabled
+
+**Deliverable:** Compliance foundation ready; safe to proceed with development.
+
+---
+
+### Day 2: Workflow Backbone (Temporal)
+
+- [ ] **Provision Temporal Cloud namespace**
+  - Create namespace: `vantage-prod`
+  - Execute BAA
+  - Configure RBAC groups (SRE, Dev read-only)
+
+- [ ] **Register Search Attributes**
+  ```bash
+  temporal operator search-attribute create \
+    --namespace vantage-prod \
+    --name SessionId --type Keyword \
+    --name TenantId --type Keyword \
+    --name LocationId --type Keyword \
+    --name SessionStatus --type Keyword \
+    --name Progress --type Int \
+    --name BuildId --type Keyword
+  ```
+
+- [ ] **Deploy Temporal worker (cloud)**
+  - Initialize `packages/workflows`
+  - Implement `SessionWorkflow` (basic skeleton)
+  - Deploy worker to cloud
+  - Test: Start workflow via CLI
+
+- [ ] **Setup Temporal UI access**
+  - Configure SSO (SAML with Okta/Entra)
+  - Test: Login to Temporal Web UI
+
+**Deliverable:** Temporal Cloud operational with BAA; first workflow executable.
+
+**Reference:** See `docs/architecture/temporal-integration.md` for complete implementation.
+
+---
+
+### Day 3: Streaming (Split Video from Control)
+
+- [ ] **Replace MQTT video with RTP/RTSP**
+  - Create `hardware/jetson/stream-video.sh` with GStreamer pipeline:
+    ```bash
+    gst-launch-1.0 nvarguscamerasrc ! \
+      'video/x-raw(memory:NVMM),width=3840,height=2160,framerate=30/1' ! \
+      nvvidconv ! nvv4l2h265enc preset-level=1 ! \
+      rtph265pay pt=96 ! udpsink host=<WORKSTATION_IP> port=5600
+    ```
+
+- [ ] **Keep MQTT for control/telemetry**
+  - Enable TLS + client certificates
+  - Configure topics: `v1/dev/<deviceId>/cmd`, `v1/dev/<deviceId>/telemetry`
+
+- [ ] **Workstation RTP ingest**
+  - Create `packages/device-adapters/rtp-receiver`
+  - Receive H.265 stream → write to MinIO local
+  - Emit `Capture` row in PostgreSQL
+
+**Deliverable:** Video streaming via RTP (not MQTT); control via MQTT with TLS.
+
+---
+
+### Day 4: Sync & Consistency (CDC + Postgres Replication)
+
+- [ ] **Enable PostgreSQL logical replication**
+  ```sql
+  -- On cloud PostgreSQL
+  ALTER SYSTEM SET wal_level = logical;
+  CREATE PUBLICATION vantage_pub FOR ALL TABLES;
+
+  -- On workstation PostgreSQL
+  CREATE SUBSCRIPTION vantage_sub
+    CONNECTION 'host=cloud.vantage.health port=5432 dbname=vantage'
+    PUBLICATION vantage_pub;
+  ```
+
+- [ ] **Deploy CDC pipeline (Debezium)**
+  - Setup Kafka/Redpanda (or NATS JetStream)
+  - Configure Debezium connector for `session_events` table
+  - Deploy consumer on workstation:
+    ```typescript
+    // packages/sync-engine/src/cdc-consumer.ts
+    await kafka.consumer().subscribe({ topic: 'db.public.session_events' })
+    ```
+
+- [ ] **Implement Row-Level Security (RLS)**
+  ```sql
+  ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY tenant_isolation ON sessions
+    USING (tenant_id = current_setting('app.tenant_id')::text);
+  ```
+
+**Deliverable:** Bidirectional sync operational (cloud ↔ workstation); RLS enforced.
+
+---
+
+### Day 5: Telemetered End-to-End (OpenTelemetry)
+
+- [ ] **Setup OpenTelemetry across stack**
+  - Cloud API (NestJS): Add tracing interceptor
+  - Mobile (Expo): Instrument tRPC client
+  - Workstation: Instrument activities
+  - Temporal: Propagate `traceparent` headers
+
+- [ ] **Configure Datadog APM**
+  - Deploy Datadog agent (with BAA)
+  - Configure: No PHI in traces/logs (validate with filters)
+  - Create service map: Mobile → API → Temporal → Workstation
+
+- [ ] **Set SLO dashboards**
+  - Session completion rate: 99% < 30 min
+  - API response time (p95): < 500ms
+  - Sync lag: < 60s
+  - Cloud → Mobile latency: < 2s
+
+- [ ] **Validate: No PHI in logs/spans**
+  ```bash
+  # Automated scan
+  grep -r "ssn\|dob\|patient.*name" /var/log/datadog-agent/
+  ```
+
+**Deliverable:** Distributed tracing operational; SLO dashboards live; PHI-free logging validated.
+
+---
+
+### Week 1 Goal
+
+✅ **Compliance-first foundation:** All BAAs executed, PHI boundaries enforced
+✅ **Durable workflows:** Temporal Cloud operational with first `SessionWorkflow`
+✅ **Streaming architecture:** RTP for video, MQTT for control
+✅ **Sync backbone:** PostgreSQL replication + CDC operational
+✅ **Observability:** OpenTelemetry end-to-end with PHI-free logging
+
+**Next:** Week 2-4 focus on implementing full `SessionWorkflow` activities, building Facilitator Portal, and integrating first devices (Canon cameras).
+
+---
+
+## 17. Open Source Strategy
+
+### 17.1 Public Repository
 
 **Repo:** `vantage-health/vantage` (MIT License)
 
@@ -2389,7 +2646,7 @@ transparent, patient-centric health platform.
 MIT License - see [LICENSE](LICENSE)
 ```
 
-### 16.2 Community Engagement
+### 17.2 Community Engagement
 
 **Launch Plan:**
 1. **Soft launch:** Tweet thread + Hacker News post
@@ -2407,9 +2664,9 @@ MIT License - see [LICENSE](LICENSE)
 
 ---
 
-## 17. Long-Term Vision
+## 18. Long-Term Vision
 
-### 17.1 3-Year Roadmap
+### 18.1 3-Year Roadmap
 
 **Year 1:**
 - Launch mobile app (10K downloads)
@@ -2429,7 +2686,7 @@ MIT License - see [LICENSE](LICENSE)
 - FDA cleared for diagnostic use
 - $50M Series A
 
-### 17.2 Impact Goals
+### 18.2 Impact Goals
 
 **Health Equity:**
 - Reduce cost of comprehensive imaging 10×
@@ -2448,7 +2705,7 @@ MIT License - see [LICENSE](LICENSE)
 
 ---
 
-## 18. Conclusion
+## 19. Conclusion
 
 The **3 Computer Architecture** transforms Vantage into a scalable, transparent, patient-centric health platform. By distributing intelligence across cloud (training + orchestration), workstation (real-time inference), and mobile/edge (patient interface), we achieve:
 
