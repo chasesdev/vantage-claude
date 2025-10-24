@@ -1,0 +1,67 @@
+# OCT (Optical Coherence Tomography) Narrative Template
+# Version: 1.0.0
+# Language: English
+# Reading Level: 6th grade (Flesch-Kincaid)
+
+modality: OCT
+version: 1.0.0
+
+steps:
+  prep_light:
+    text: "Dimming the lights for 30 seconds."
+    why: "Dark adaptation helps your eyes prepare for the scan."
+    doNow: "Relax and let your eyes adjust."
+    icon: "lightbulb-dim"
+    privacy: "processing_local"
+    etaHint: "~30 seconds"
+
+  focus_left:
+    text: "We're focusing on your left eye."
+    why: "Focus helps capture sharp images of the retina."
+    doNow: "Look at the green dot. Try not to blink."
+    icon: "eye-focus"
+    privacy: "processing_local"
+
+  capture_left:
+    text: "Taking an image of your left eye."
+    why: "This image helps check retinal layers."
+    doNow: "Hold still for a second."
+    icon: "camera"
+    privacy: "processing_local"
+
+  focus_right:
+    text: "We're focusing on your right eye."
+    why: "We scan both eyes to get a complete picture."
+    doNow: "Look at the green dot. Try not to blink."
+    icon: "eye-focus"
+    privacy: "processing_local"
+
+  capture_right:
+    text: "Taking an image of your right eye."
+    why: "This completes your retinal scan."
+    doNow: "Hold still for a second."
+    icon: "camera"
+    privacy: "processing_local"
+
+  ai_qc:
+    text: "Checking image quality."
+    why: "We verify clarity before moving on."
+    doNow: "Relax—no action needed."
+    icon: "ai-check"
+    privacy: "processing_local"
+
+  sending_summary:
+    text: "Summarizing results."
+    why: "We compute measurements for your report."
+    doNow: "You're doing great."
+    icon: "upload"
+    privacy: "sending_summary"
+    etaHint: "~1 minute"
+    alert: "We're sending a summary (not full images) for analysis."
+
+  done:
+    text: "All done!"
+    why: "Your retinal scan is complete."
+    doNow: "You can relax. Results will be in your app soon."
+    icon: "check-circle"
+    privacy: "processing_local"

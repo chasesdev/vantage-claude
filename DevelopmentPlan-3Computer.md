@@ -2581,7 +2581,545 @@ WantedBy=multi-user.target
 ✅ **Sync backbone:** PostgreSQL replication + CDC operational
 ✅ **Observability:** OpenTelemetry end-to-end with PHI-free logging
 
-**Next:** Week 2-4 focus on implementing full `SessionWorkflow` activities, building Facilitator Portal, and integrating first devices (Canon cameras).
+**Next:** Week 2-4 focus on implementing full `SessionWorkflow` activities, local compute policy, Narrative Layer, and building Facilitator Portal.
+
+---
+
+## 16.5. Local Compute Decision Policy Architecture
+
+### Overview
+
+The **"Local when sensible"** policy deterministically routes compute operations between Edge (Jetson), Workstation (RTX 6000 Pro), and Cloud (DGX/Colo) based on SLA, privacy, connectivity, VRAM, and cost constraints.
+
+**Principle:** Run closest to the sensor if it materially improves SLA or privacy; only promote PHI off-site when necessary and allowed.
+
+### Decision Matrix
+
+| Dimension | Edge (Jetson) | Workstation (RTX 6000 Pro) | Cloud (DGX/Colo) |
+|:--|:--|:--|:--|
+| **Latency SLA** | < 50 ms/frame (preproc) | 50–500 ms op (interactive UX) | > 1 s (batch/async) |
+| **Connectivity** | Poor/intermittent | Good LAN | Internet required |
+| **Data Sensitivity** | Raw video/frames stay local | PHI stays local; export by policy | De-identified features or encrypted PHI under BAA |
+| **Model Size/VRAM** | Tiny–small (INT8/FP16 TensorRT) | Small–medium real-time; local LLM (Ollama/vLLM) | Large fusion, training, retrospective |
+| **Compute Cost** | Low, fixed | Medium, fixed | Elastic, $$ per burst |
+| **Examples** | Denoise, stabilization, ROI detect | VIS pose check, retinal segmentation, QC, live guidance | Multimodal fusion, longitudinal risk, report synth, cohort analytics |
+
+### Decision Heuristics
+
+Policy evaluates per request using five gates:
+
+1. **SLA gate:** If target latency < 500 ms and bandwidth/jitter unknown → prefer workstation
+2. **Privacy gate:** If payload contains "raw imaging PHI", keep raw on workstation; send features or masks to cloud
+3. **Size/VRAM gate:** If model > local VRAM or needs multi-GPU → cloud
+4. **Connectivity gate:** If uplink < 20 Mbps sustained or jitter > 30 ms → local
+5. **Cost gate:** If compute minutes exceed location's daily budget, fall back to local (degraded mode)
+
+### Execution Policy Library
+
+```typescript
+// packages/policy/src/execution-policy.ts
+type Context = {
+  slaMs: number
+  payloadType: 'raw_image'|'features'|'metrics'
+  uplinkMbps: number
+  jitterMs: number
+  vrams: { jetson: number; workstation: number }
+  model: { name: string; vramGB: number; tier: 'tiny'|'small'|'medium'|'large' }
+  privacy: 'phi_raw'|'phi_masked'|'deidentified'
+  cost: { dailyGpuBudgetUsd: number; spentUsd: number }
+}
+
+export type Target = 'edge'|'workstation'|'cloud'
+
+export function decideTarget(ctx: Context): Target {
+  if (ctx.privacy === 'phi_raw' && ctx.slaMs <= 500) return 'workstation'
+  if (ctx.slaMs <= 50 && ctx.model.tier === 'tiny') return 'edge'
+  if (ctx.model.vramGB > ctx.vrams.workstation) return 'cloud'
+  if (ctx.uplinkMbps < 20 || ctx.jitterMs > 30) return 'workstation'
+  if (ctx.cost.spentUsd > ctx.cost.dailyGpuBudgetUsd) return 'workstation'
+  return ctx.slaMs <= 500 ? 'workstation' : 'cloud'
+}
+```
+
+### Integration with Temporal Workflows
+
+```typescript
+// packages/workflows/src/session.workflow.ts
+import { decideTarget } from '@vantage/policy'
+import { activities as a } from './activities'
+
+export async function sessionWorkflow(input: { sessionId: string }) {
+  const ctx = await a.collectRuntimeContext(input)
+
+  // Decide where to run segmentation
+  const t1 = decideTarget({
+    ...ctx,
+    slaMs: 120,
+    payloadType: 'raw_image',
+    privacy: 'phi_raw'
+  })
+  await (t1 === 'workstation' ? a.segWorkstation : a.segCloud)(input)
+
+  // Decide where to run fusion
+  const t2 = decideTarget({
+    ...ctx,
+    slaMs: 3000,
+    payloadType: 'features',
+    privacy: 'deidentified'
+  })
+  await (t2 === 'cloud' ? a.fuseCloud : a.fuseWorkstation)(input)
+
+  await a.generateReport(input) // Policy inside decides PDF render location
+}
+```
+
+### PHI Rings Model
+
+Treat PHI as concentric rings; never cross inward → outward without policy.
+
+| Ring | Examples | Allowed Moves |
+|:--|:--|:--|
+| **Ring 0 (Sensor)** | Live photons, raw frames | → Edge (temp buffer) |
+| **Ring 1 (Edge/Workstation PHI)** | Raw images, DICOM, session events | → Cloud only with BAA + encryption + consent |
+| **Ring 2 (Derived)** | Segmentation masks, embeddings, QC scores | ↔ Cloud freely (encrypted) |
+| **Ring 3 (Analytics)** | Aggregates, trends, de-identified cohorts | Public/open artifacts (MIT) |
+
+### Controls
+
+- **Object storage:** Bucket per tenant, SSE-KMS, object-lock for reports/audit
+- **Logs/APM:** No PHI; use opaque IDs; redaction filters in pipeline
+- **Push notifications:** IDs only; app pulls details via tRPC
+
+### Model Packaging & Delivery
+
+**Artifacts per target:**
+- **Edge (Jetson):** TensorRT engines (FP16/INT8), max-batch=1; GStreamer plugins for preproc
+- **Workstation:** ONNX/TensorRT for vision; vLLM/Ollama for small LLMs
+- **Cloud:** PyTorch FP32/AMP; distributed where needed; fusion models
+
+**Delivery:**
+- Store models as OCI images (model layers + metadata)
+- Pull by semantic version and capability label (e.g., `retina/seg:2.4.1-cv3`)
+
+**Runtime:**
+- Sidecar "model-runner" exposes gRPC: `Infer(Image|Tensor) → Features/Mask/JSON`
+- Health/metrics exported via OpenTelemetry
+
+---
+
+## 16.6. Narrative Layer Architecture
+
+### Overview
+
+The **Narrative Layer** transforms low-level workflow/device events into plain-language patient-facing updates, showing what's happening, why it matters, what to do now, and where data goes—in real time.
+
+**Insight:** Keep ops truth (Temporal event history) and patient story (narrative stream) derived from the same source. Different views, one ground truth.
+
+### Architecture
+
+```
+┌───────────────┐       Signals/Attrs        ┌───────────────────────┐
+│ Temporal/Cloud│ ─────────────────────────▶ │ Narrative Service     │
+│ (workflow SoR)│                            │ (Computer 2 primary)  │
+└─────┬─────────┘                            │ - Maps events→story   │
+      │ CDC / WS                            │ - i18n + safety copy  │
+      ▼                                      │ - Privacy ring status │
+┌───────────────┐   RTP/ROS2/MQTT events     └───────────┬───────────┘
+│ Workstation   │ ◀───────────────────────────┐          │
+│ (ingest+AI)   │                             │          │
+└─────┬─────────┘                             │     WebSocket/tRPC
+      │                                       │          │
+      ▼                                       ▼          ▼
+┌───────────────┐                      ┌──────────┐  ┌──────────┐
+│ Jetson (edge) │                      │ iPad (UX)│  │ Mobile   │
+│ (prep)        │                      │ in-room  │  │ (patient)│
+└───────────────┘                      └──────────┘  └──────────┘
+```
+
+### Patient-Facing Model
+
+Each narrative event contains:
+
+| Field | Purpose | Example |
+|:--|:--|:--|
+| **step** | Stage name | `oct.focus_left_eye` |
+| **plainText** | 6th-grade reading level | "We're focusing on your left eye." |
+| **why** | Short rationale | "This helps measure the retina layers clearly." |
+| **doNow** | Patient action | "Keep your eye open and look at the green dot." |
+| **progress** | 0–100 | 45 |
+| **privacyBadge** | Data locality | `processing_local` / `sending_summary` |
+| **etaHint** | Soft hint (non-binding) | "~a minute" (optional) |
+| **alert** | Safety flag | "Laser is low-power; blink if uncomfortable." |
+
+**Guardrails:** Keep clinical claims out; prefer rationale over diagnosis; show privacy ring status with one line.
+
+### Device-Specific Storyboards
+
+| Modality | Steps (mapped to workflow events) | What patient sees |
+|:--|:--|:--|
+| **VIS (3D body)** | setup → pose_align → platform_rotate → capture_burst → ai_qc → done | "We're aligning your pose." → "Platform turning slowly (20s)." → "Capturing 24 photos." |
+| **OCT/Retinal** | prep_light → focus_left → capture_left → focus_right → capture_right → ai_qc → done | "Dim lights for 30s." → "Left eye focus." → "Image taken." |
+| **DEXA** | prep_remove_metal → position → scan_run → ai_qc → done | "Lie still; scanning your whole body." |
+| **VO₂** | mask_fit → warmup → incremental_stage_n → cooldown → ai_qc → done | "Breathing mask on." → "Pace increasing." |
+| **BP/Grip** | prep → measurement_n → ai_qc → done | "Cuff inflating." |
+
+### Narrative Templates (YAML DSL)
+
+```yaml
+# packages/narrative/templates/oct.v1.yaml
+modality: OCT
+version: 1.2.0
+steps:
+  focus_left:
+    text: "We're focusing on your left eye."
+    why: "Focus helps capture sharp images of the retina."
+    doNow: "Look at the green dot. Try not to blink."
+    icon: "eye-focus"
+    privacy: "processing_local"
+  capture_left:
+    text: "Taking an image of your left eye."
+    why: "This image helps check retinal layers."
+    doNow: "Hold still for a second."
+    icon: "camera"
+    privacy: "processing_local"
+  ai_qc:
+    text: "Checking image quality."
+    why: "We verify clarity before moving on."
+    doNow: "Relax—no action needed."
+    icon: "ai-check"
+    privacy: "processing_local"
+  sending_summary:
+    text: "Summarizing results."
+    why: "We compute measurements for your report."
+    doNow: "You're doing great."
+    icon: "upload"
+    privacy: "sending_summary"
+```
+
+### Implementation Pattern
+
+**1. Emit rich events from workflows:**
+
+```typescript
+// packages/workflows/src/oct.workflow.ts
+import { upsertSearchAttributes, defineSignal, setHandler } from '@temporalio/workflow'
+
+export const patientStep = defineSignal<[{ step: string, progress?: number, privacy?: string }]>('patientStep')
+
+export async function octWorkflow({ sessionId, tenantId, locationId }) {
+  upsertSearchAttributes({ SessionId: sessionId, Modality: 'OCT', Progress: 0 })
+
+  await activities.dimLights()
+  workflow.signal(patientStep, { step: 'prep_light', progress: 5, privacy: 'processing_local' })
+
+  await activities.focusEye('left')
+  workflow.signal(patientStep, { step: 'focus_left', progress: 20 })
+
+  await activities.captureEye('left')
+  workflow.signal(patientStep, { step: 'capture_left', progress: 40 })
+
+  await activities.qualityCheck()
+  workflow.signal(patientStep, { step: 'ai_qc', progress: 60 })
+
+  upsertSearchAttributes({ Progress: 100, SessionStatus: 'COMPLETED' })
+}
+```
+
+**2. Narrative Service translates to patient copy:**
+
+```typescript
+// apps/narrative-service/src/event-to-narrative.ts
+import templates from '../templates'
+
+export function toNarrative(e: Event, modality: string): NarrativeEvent {
+  const t = templates[modality][e.step]
+  return {
+    step: e.step,
+    plainText: t.text,
+    why: t.why,
+    doNow: t.doNow,
+    icon: t.icon,
+    progress: e.progress ?? 0,
+    privacyBadge: e.privacy ?? t.privacy
+  }
+}
+```
+
+**3. Deliver to iPad/mobile in real time:**
+
+```typescript
+// apps/narrative-service/src/ws.ts
+wss.on('connection', (socket, { sessionId, modality }) => {
+  subscribeTemporal(sessionId, (evt) => {
+    socket.send(JSON.stringify(toNarrative(evt, modality)))
+  })
+})
+```
+
+**4. Mobile component:**
+
+```tsx
+// apps/mobile/components/LiveNarrative.tsx
+export function LiveNarrative({ sessionId, modality }) {
+  const [events, setEvents] = useState<NarrativeEvent[]>([])
+
+  useEffect(() => {
+    const ws = new WebSocket(`${API_WS}/narrative/${sessionId}?m=${modality}`)
+    ws.onmessage = (m) => setEvents((e) => [...e, JSON.parse(m.data)])
+    return () => ws.close()
+  }, [sessionId, modality])
+
+  return (
+    <ScrollView className="p-4">
+      {events.map((e, i) => (
+        <View key={i} className="bg-white rounded-xl p-4 mb-3 shadow">
+          <Text className="text-lg font-semibold">{humanize(e.step)}</Text>
+          <Text className="text-gray-800 mt-1">{e.plainText}</Text>
+          <Text className="text-gray-600 mt-1">Why: {e.why}</Text>
+          <Text className="mt-1">{e.doNow}</Text>
+          <ProgressBar value={e.progress} />
+          <PrivacyBadge kind={e.privacyBadge} />
+        </View>
+      ))}
+    </ScrollView>
+  )
+}
+```
+
+### Privacy Transparency
+
+Surface the same "rings" we enforce technically:
+
+- **Local only:** "Your images are being processed on this device."
+- **Sending summary:** "We're sending a summary (not the full image) for advanced analysis."
+- **Cloud analysis:** "Encrypted processing in our secure data center."
+
+Tie badges directly to event transitions so the message always matches actual data flow.
+
+### Validation Metrics
+
+| Metric | Goal | How |
+|:--|:--|:--|
+| **Comprehension tap ("Got it")** | > 85% per step | 1-tap feedback on cards |
+| **Aborted captures due to motion** | −30% | Correlate QC fail with narrative timing |
+| **Average session anxiety score** | −20% | Post-session 3-question survey |
+| **Support interrupts** | −50% | Fewer facilitator interventions |
+
+---
+
+## 16.7. Week 2-4 Action Plan
+
+**Prerequisites:** Week 1 completed (Temporal Cloud operational, streaming architecture, sync backbone)
+
+### Week 2: Local Compute Policy & Model Infrastructure
+
+#### Day 1-2: Policy Library Implementation
+
+- [ ] **Create `packages/policy` package**
+  - Implement `execution-policy.ts` with `decideTarget()` function
+  - Comprehensive unit tests covering all 5 gates
+  - TypeScript types for Context and Target
+  - Export as `@vantage/policy`
+
+- [ ] **Create activity variants by target**
+  - Split activities into `*Workstation` and `*Cloud` variants
+  - Example: `segWorkstation()`, `segCloud()`
+  - Wire into Temporal workflow with policy routing
+
+- [ ] **Implement runtime context collector**
+  - `collectRuntimeContext()` activity
+  - Fetch: uplink speed, jitter, VRAM availability, daily budget/spend
+  - Cache for session duration
+
+**Deliverable:** Policy library operational with unit tests; workflows route based on policy.
+
+#### Day 3-4: Model Registry & Packaging
+
+- [ ] **Design OCI model registry**
+  - Schema for model metadata (version, capability labels, VRAM requirements)
+  - Example: `retina/seg:2.4.1-cv3`
+  - Push/pull via Docker registry or Harbor
+
+- [ ] **Create model runner sidecar**
+  - gRPC service: `Infer(Image|Tensor) → Features/Mask/JSON`
+  - Supports ONNX, TensorRT, PyTorch
+  - Health checks and readiness probes
+  - Deploy as Docker Compose service on workstation
+
+- [ ] **Package first model (retinal segmentation)**
+  - Export ONNX model
+  - Build OCI image with model + metadata
+  - Push to registry
+  - Test pull and inference on workstation
+
+**Deliverable:** Model registry operational; first model deployed as OCI artifact with gRPC inference.
+
+#### Day 5: PHI Rings Enforcement
+
+- [ ] **Implement storage layer controls**
+  - S3/MinIO bucket layout per ring (Ring0, Ring1, Ring2, Ring3)
+  - SSE-KMS encryption for Ring 1 (PHI) buckets
+  - Object lifecycle policies
+  - Access logging for audit
+
+- [ ] **Configure log redaction**
+  - OpenTelemetry redaction filter (no PHI in traces/logs)
+  - Datadog tag filters (block `user.name`, `patient.*`, etc.)
+  - Test with synthetic PHI data
+
+- [ ] **Document PHI rings**
+  - Create `docs/security/phi-rings.md`
+  - Data flow diagrams showing ring boundaries
+  - Allowed transitions
+
+**Deliverable:** PHI rings enforced in storage; logs/APM verified PHI-free.
+
+---
+
+### Week 3: Narrative Layer Foundation
+
+#### Day 1-2: Narrative Service Core
+
+- [ ] **Create `packages/narrative` package**
+  - Template loader (YAML → JSON)
+  - Event mapper (`toNarrative()` function)
+  - TypeScript types for `NarrativeEvent`
+  - Comprehensive unit tests
+
+- [ ] **Create `apps/narrative-service` app**
+  - Express + WebSocket server
+  - Subscribe to Temporal workflow events (via Search Attributes API or CDC)
+  - Push narrative events to connected clients
+  - Healthcheck endpoint
+
+- [ ] **Deploy Narrative Service to workstation**
+  - Add to Docker Compose
+  - Wire to Temporal Cloud via mTLS
+  - Configure environment variables
+
+**Deliverable:** Narrative Service operational; subscribes to Temporal events.
+
+#### Day 3-4: First Narrative Template & Workflow Integration
+
+- [ ] **Author OCT v1 narrative template**
+  - Create `packages/narrative/templates/oct.v1.yaml`
+  - English copy (6th-grade reading level)
+  - All steps: prep_light, focus_left, capture_left, focus_right, capture_right, ai_qc, sending_summary
+  - Privacy badges per step
+
+- [ ] **Update OCT workflow with patientStep signals**
+  - Emit `patientStep` signal at each workflow step
+  - Include: step name, progress %, privacy badge
+  - Wire to Narrative Service
+
+- [ ] **Test end-to-end (OCT workflow → Narrative Service)**
+  - Start OCT workflow manually
+  - Verify narrative events emitted
+  - Inspect WebSocket messages
+
+**Deliverable:** OCT narrative template complete; OCT workflow emits patient-facing events.
+
+#### Day 5: Mobile Integration (LiveNarrative Component)
+
+- [ ] **Create `LiveNarrative.tsx` component (mobile)**
+  - WebSocket connection to Narrative Service
+  - Display narrative event cards
+  - Progress bar
+  - Privacy badge component
+  - Scroll view with history
+
+- [ ] **Create `PrivacyBadge.tsx` component**
+  - Badge UI for: `processing_local`, `sending_summary`, `cloud_processing`
+  - Tooltip with one-line explanation
+  - Styles consistent with mobile design system
+
+- [ ] **Wire into mobile app session screen**
+  - Show LiveNarrative during active sessions
+  - Hide when session complete
+  - Test with simulated OCT workflow
+
+**Deliverable:** Mobile app displays live narrative during sessions; privacy badges visible.
+
+---
+
+### Week 4: Multi-Modality Narrative & First Integration Test
+
+#### Day 1-3: Additional Narrative Templates
+
+- [ ] **Create VIS narrative template**
+  - `packages/narrative/templates/vis.v1.yaml`
+  - Steps: setup, pose_align, platform_rotate, capture_burst, ai_qc, done
+  - English copy
+
+- [ ] **Create DEXA narrative template**
+  - `packages/narrative/templates/dexa.v1.yaml`
+  - Steps: prep_remove_metal, position, scan_run, ai_qc, done
+  - English copy
+
+- [ ] **Create VO₂ narrative template**
+  - `packages/narrative/templates/vo2.v1.yaml`
+  - Steps: mask_fit, warmup, incremental_stage_n, cooldown, ai_qc, done
+  - English copy
+
+- [ ] **Add Spanish i18n for OCT template**
+  - Create `packages/narrative/templates/oct.v1.es.yaml`
+  - Professional translation (or AI + human review)
+  - Test language switching
+
+**Deliverable:** Narrative templates for VIS, DEXA, VO₂; OCT template in Spanish.
+
+#### Day 4: Narrative Editor (Facilitator Portal)
+
+- [ ] **Create narrative editor page**
+  - Next.js page: `/narrative-editor`
+  - Load templates from `packages/narrative/templates`
+  - Live preview (render as mobile would see it)
+  - Edit inline (non-engineers can safely update copy)
+  - Save with version control (Git commit on save)
+
+- [ ] **Add authentication/RBAC**
+  - Only facilitators/admins can edit templates
+  - Audit log of template changes
+
+**Deliverable:** Narrative editor in facilitator portal; safe template editing for non-engineers.
+
+#### Day 5: End-to-End Integration Test
+
+- [ ] **Conduct full session test (OCT)**
+  - Real OCT device (or simulator)
+  - Workstation runs OCT workflow
+  - Policy routes operations (workstation vs cloud)
+  - Narrative Service emits events
+  - Mobile app displays live narrative
+  - Patient sees privacy badges
+  - Session completes → report generated
+
+- [ ] **Measure narrative metrics**
+  - Instrument comprehension taps (1-tap feedback)
+  - Correlate QC failures with narrative timing
+  - Collect initial baseline data
+
+- [ ] **Document findings**
+  - Create `docs/testing/week-4-integration-test.md`
+  - Screenshots of mobile narrative view
+  - Metrics baseline
+
+**Deliverable:** End-to-end OCT session with live narrative; metrics baseline established.
+
+---
+
+### Week 2-4 Goals
+
+✅ **Local compute policy operational:** Activities route based on SLA/privacy/cost
+✅ **Model registry and OCI packaging:** First model deployed as OCI artifact
+✅ **PHI rings enforced:** Storage layer respects ring boundaries
+✅ **Narrative Layer operational:** Translates workflow events to patient-facing copy
+✅ **Multi-modality templates:** OCT, VIS, DEXA, VO₂ narratives authored
+✅ **Mobile integration:** LiveNarrative component displays real-time updates
+✅ **Narrative editor:** Non-engineers can safely edit templates
+✅ **End-to-end test:** Full OCT session with live narrative and privacy badges
+
+**Next:** Week 5-6 focus on building Facilitator Portal features (device status, session management) and integrating Canon cameras for VIS system.
 
 ---
 
